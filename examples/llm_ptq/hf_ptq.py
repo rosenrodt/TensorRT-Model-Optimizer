@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# $ python examples/llm_ptq/hf_ptq.py --pyt_ckpt_path=/home/scratch.trt_llm_data/llm-models/Qwen3/Qwen3-30B-A3B --export_path=/mnt/llm-models/Qwen3-30B-A3B-fp8attn-w4a8mlp-fp8kv-custom --qformat=mixed_fp8attn_w4a8mlp --export_fmt=hf --kv_cache_qformat fp8 2>&1 | tee qwen3-30b-a3b-fp8attn-w4a8mlp-fp8kv-custom.log
+
 import argparse
 import copy
 import random
@@ -79,6 +81,30 @@ QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
     "w4a8_nvfp4_fp8": mtq.W4A8_NVFP4_FP8_CFG,
     "w4a8_mxfp4_fp8": mtq.W4A8_MXFP4_FP8_CFG,
     "nvfp4_mlp_only": mtq.NVFP4_MLP_ONLY_CFG,
+    "mixed_fp8attn_w4a8mlp": {
+        "mixed_precision": True,
+        "configs": [
+            {
+                "quant_cfg": {
+                    "*mlp*weight_quantizer": [
+                        {"num_bits": 4, "block_sizes": {-1: 128, "type": "static"}, "enable": True},
+                        {"num_bits": (4, 3), "axis": None, "enable": True},
+                    ],
+                    "*mlp*input_quantizer": {"num_bits": (4, 3), "axis": None, "enable": True},
+                    **mtq.config._default_disabled_quantizer_cfg,
+                },
+                "algorithm": "awq_lite",
+            },
+            {
+                "quant_cfg": {
+                    "*self_attn*weight_quantizer": {"num_bits": (4, 3), "axis": None, "enable": True},
+                    "*self_attn*input_quantizer": {"num_bits": (4, 3), "axis": None, "enable": True},
+                    **mtq.config._default_disabled_quantizer_cfg,
+                },
+                "algorithm": "max",
+            },
+        ],
+    },
 }
 
 KV_QUANT_CFG_CHOICES = {
@@ -172,6 +198,53 @@ def quantize_model(model, quant_cfg, args, calib_dataloader=None, calibration_on
     #
     # We also provided a util method to generate the forward_loop with additional error handlings.
 
+    # Check if this is a mixed precision configuration
+    is_mixed_precision = quant_cfg.get("mixed_precision", False)
+
+    # Mixed precision quantization requires isolated calibration for each config
+    if is_mixed_precision:
+        calibrate_loop = create_forward_loop(dataloader=calib_dataloader)
+
+        print("Starting mixed precision quantization...")
+        start_time = time.time()
+
+        # Step 1: Apply quantize mode to the model
+        model = mto.apply_mode(model, mode=[("quantize", {})])
+
+        # Step 2: Sequentially calibrate each configuration
+        DISABLE_CFG = {"quant_cfg": {"default": {"enable": False}}}
+
+        for i, config in enumerate(quant_cfg["configs"]):
+            print(f"Calibrating configuration {i+1}/{len(quant_cfg['configs'])} with algorithm '{config['algorithm']}'...")
+
+            # Disable all quantizers
+            mtq.set_quantizer_by_cfg(model, DISABLE_CFG["quant_cfg"])
+
+            # Enable quantizers for this specific configuration
+            mtq.set_quantizer_by_cfg(model, config["quant_cfg"])
+
+            # Calibrate with the configuration's algorithm
+            mtq.calibrate(model, config["algorithm"], forward_loop=calibrate_loop)
+
+            # Print intermediate summary
+            print(f"Configuration {i+1}/{len(quant_cfg['configs'])} calibration summary:")
+            mtq.print_quant_summary(model)
+
+        # Step 3: Re-enable all quantizers from all configs
+        print("Re-enabling all quantizers...")
+        cfg_all = {"quant_cfg": {}}
+        for config in quant_cfg["configs"]:
+            cfg_all["quant_cfg"].update(config["quant_cfg"])
+        mtq.set_quantizer_by_cfg(model, cfg_all["quant_cfg"])
+
+        # Step 4: Calibrate one last time so amax does not get reset
+        mtq.calibrate(model, 'max', forward_loop=calibrate_loop)
+
+        end_time = time.time()
+        print(f"Mixed precision quantization done. Total time used: {end_time - start_time}s")
+        return model
+
+    # Standard quantization path
     use_calibration = args.auto_quantize_bits or need_calibration(quant_cfg)
 
     if not use_calibration:
@@ -234,6 +307,7 @@ def main(args):
                 "fp8_pb_wo",
                 "w4a8_mxfp4_fp8",
                 "nvfp4_mlp_only",
+                "mixed_fp8attn_w4a8mlp",
             ]
             or args.kv_cache_qformat in KV_QUANT_CFG_CHOICES
         ), f"Quantization format {args.qformat} not supported for HF export path"
@@ -359,7 +433,7 @@ def main(args):
         mts.export(model)
 
     if args.auto_quantize_bits or args.qformat in QUANT_CFG_CHOICES:
-        if "awq" in args.qformat:
+        if "awq" in args.qformat or args.qformat == "mixed_fp8attn_w4a8mlp":
             print(
                 "\n####\nAWQ calibration could take longer than other calibration methods. "
                 "Consider reducing calib_size to reduce calibration time.\n####\n"
@@ -369,7 +443,7 @@ def main(args):
             # Calibration/sparsification will actually take much more memory than regular inference
             # due to intermediate tensors for fake quantization. Setting sample_memory_usage_ratio
             # to 2 to avoid OOM for AWQ/SmoothQuant fake quantization as it will take more memory than inference.
-            sample_memory_usage_ratio = 2 if "awq" in args.qformat or "sq" in args.qformat else 1.1
+            sample_memory_usage_ratio = 2 if "awq" in args.qformat or "sq" in args.qformat or args.qformat == "mixed_fp8attn_w4a8mlp" else 1.1
             # Whisper model expects mel-spectrogram input features of length 3000
             # Whisper model needs input of shape (batch_size, num_mel_bins, 3000)
             # As the encoder of Whisper doesn't have embedding layer, input dtype has to be float
@@ -461,15 +535,31 @@ def main(args):
                 if args.qformat == "w4a8_awq" and model_type in ["gemma", "mpt"]:
                     quant_cfg["algorithm"] = {"method": "awq_lite", "alpha_step": 1}
 
+            if args.qformat == "mixed_fp8attn_w4a8mlp":
+                quant_cfg = copy.deepcopy(QUANT_CFG_CHOICES[args.qformat])
+                # If awq_block_size argument is provided, update weight_quantizer in the MLP config
+                if args.awq_block_size:
+                    mlp_config = quant_cfg["configs"][0]  # First config is MLP with AWQ
+                    weight_quantizer = mlp_config["quant_cfg"]["*mlp*weight_quantizer"]
+                    if isinstance(weight_quantizer, list):
+                        weight_quantizer = weight_quantizer[0]
+                    weight_quantizer["block_sizes"][-1] = args.awq_block_size
+
             enable_quant_kv_cache = args.kv_cache_qformat != "none"
             print(f"{'Enable' if enable_quant_kv_cache else 'Disable'} KV cache quantization")
 
             # Check if any bmm_quantizer is in the quant_cfg. If so, we need to enable the bmm_quantizer.
             if enable_quant_kv_cache:
-                quant_cfg = apply_kv_cache_quant(
-                    quant_cfg,
-                    getattr(mtq, KV_QUANT_CFG_CHOICES[args.kv_cache_qformat])["quant_cfg"],
-                )
+                if args.qformat == "mixed_fp8attn_w4a8mlp":
+                    # For mixed precision, apply KV cache quant to both configs
+                    kv_cache_cfg = getattr(mtq, KV_QUANT_CFG_CHOICES[args.kv_cache_qformat])["quant_cfg"]
+                    for config in quant_cfg["configs"]:
+                        config["quant_cfg"].update(kv_cache_cfg)
+                else:
+                    quant_cfg = apply_kv_cache_quant(
+                        quant_cfg,
+                        getattr(mtq, KV_QUANT_CFG_CHOICES[args.kv_cache_qformat])["quant_cfg"],
+                    )
 
             # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
             if model_type == "gemma" and "int8_sq" in args.qformat:
@@ -477,10 +567,18 @@ def main(args):
 
             if model_type == "phi4mm":
                 # Only quantize the language model
-                quant_cfg["quant_cfg"]["*speech*"] = {"enable": False}
-                quant_cfg["quant_cfg"]["*audio*"] = {"enable": False}
-                quant_cfg["quant_cfg"]["*image*"] = {"enable": False}
-                quant_cfg["quant_cfg"]["*vision*"] = {"enable": False}
+                if args.qformat == "mixed_fp8attn_w4a8mlp":
+                    # For mixed precision, apply to both configs
+                    for config in quant_cfg["configs"]:
+                        config["quant_cfg"]["*speech*"] = {"enable": False}
+                        config["quant_cfg"]["*audio*"] = {"enable": False}
+                        config["quant_cfg"]["*image*"] = {"enable": False}
+                        config["quant_cfg"]["*vision*"] = {"enable": False}
+                else:
+                    quant_cfg["quant_cfg"]["*speech*"] = {"enable": False}
+                    quant_cfg["quant_cfg"]["*audio*"] = {"enable": False}
+                    quant_cfg["quant_cfg"]["*image*"] = {"enable": False}
+                    quant_cfg["quant_cfg"]["*vision*"] = {"enable": False}
 
         if not model_is_already_quantized or calibration_only:
             # Only run single sample for preview
