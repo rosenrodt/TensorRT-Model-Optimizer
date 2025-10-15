@@ -238,7 +238,7 @@ def quantize_model(model, quant_cfg, args, calib_dataloader=None, calibration_on
         mtq.set_quantizer_by_cfg(model, cfg_all["quant_cfg"])
 
         # Step 4: Calibrate one last time so amax does not get reset
-        mtq.calibrate(model, 'max', forward_loop=calibrate_loop)
+        # mtq.calibrate(model, 'max', forward_loop=calibrate_loop)
 
         end_time = time.time()
         print(f"Mixed precision quantization done. Total time used: {end_time - start_time}s")
