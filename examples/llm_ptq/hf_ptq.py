@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# $ python examples/llm_ptq/hf_ptq.py --pyt_ckpt_path=/home/scratch.trt_llm_data/llm-models/Qwen3/Qwen3-30B-A3B --export_path=/mnt/llm-models/Qwen3-30B-A3B-fp8attn-w4a8mlp-fp8kv-custom --qformat=mixed_fp8attn_w4a8mlp --export_fmt=hf --kv_cache_qformat fp8 2>&1 | tee qwen3-30b-a3b-fp8attn-w4a8mlp-fp8kv-custom.log
+# $ python examples/llm_ptq/hf_ptq.py --pyt_ckpt_path=/home/scratch.trt_llm_data/llm-models/Qwen3/Qwen3-30B-A3B --export_path=/mnt/llm-models/Qwen3-30B-A3B-fp8attn-w4a8mlp-fp8kv-custom --qformat=mixed_fp8attn_w4a8mlp_awq --export_fmt=hf --kv_cache_qformat fp8 2>&1 | tee qwen3-30b-a3b-fp8attn-w4a8mlp-fp8kv-custom.log
+# $ python examples/llm_ptq/hf_ptq.py --pyt_ckpt_path=/home/scratch.trt_llm_data/llm-models/llama-3.2-models/Llama-3.2-1B-Instruct --export_path=/mnt/llm-models/Llama-3.2-1B-Instruct-fp8attn-nvfp4mlp --qformat=fp8attn_nvfp4mlp --export_fmt=hf --kv_cache_qformat fp8 2>&1 | tee llama-3.2-1b-instruct-fp8attn-nvfp4mlp.log
 
 import argparse
 import copy
@@ -81,29 +82,73 @@ QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
     "w4a8_nvfp4_fp8": mtq.W4A8_NVFP4_FP8_CFG,
     "w4a8_mxfp4_fp8": mtq.W4A8_MXFP4_FP8_CFG,
     "nvfp4_mlp_only": mtq.NVFP4_MLP_ONLY_CFG,
-    "mixed_fp8attn_w4a8mlp": {
-        "mixed_precision": True,
+    "mixed_fp8attn_w4a8mlp_awq": {
+        "mixed_algorithm": True,
         "configs": [
             {
                 "quant_cfg": {
                     "*mlp*weight_quantizer": [
-                        {"num_bits": 4, "block_sizes": {-1: 128, "type": "static"}, "enable": True},
+                        {
+                            "num_bits": 4,
+                            "block_sizes": {-1: 128, "type": "static"},
+                            "enable": True,
+                        },
                         {"num_bits": (4, 3), "axis": None, "enable": True},
                     ],
-                    "*mlp*input_quantizer": {"num_bits": (4, 3), "axis": None, "enable": True},
+                    "*mlp*input_quantizer": {
+                        "num_bits": (4, 3),
+                        "axis": None,
+                        "enable": True,
+                    },
                     **mtq.config._default_disabled_quantizer_cfg,
                 },
                 "algorithm": "awq_lite",
             },
             {
                 "quant_cfg": {
-                    "*self_attn*weight_quantizer": {"num_bits": (4, 3), "axis": None, "enable": True},
-                    "*self_attn*input_quantizer": {"num_bits": (4, 3), "axis": None, "enable": True},
+                    "*self_attn*weight_quantizer": {
+                        "num_bits": (4, 3),
+                        "axis": None,
+                        "enable": True,
+                    },
+                    "*self_attn*input_quantizer": {
+                        "num_bits": (4, 3),
+                        "axis": None,
+                        "enable": True,
+                    },
                     **mtq.config._default_disabled_quantizer_cfg,
                 },
                 "algorithm": "max",
             },
         ],
+    },
+    "fp8attn_nvfp4mlp": {
+        "quant_cfg": {
+            "*mlp*weight_quantizer": {
+                "num_bits": (2, 1),
+                "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+                "axis": None,
+                "enable": True,
+            },
+            "*mlp*input_quantizer": {
+                "num_bits": (2, 1),
+                "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+                "axis": None,
+                "enable": True,
+            },
+            "*self_attn*weight_quantizer": {
+                "num_bits": (4, 3),
+                "axis": None,
+                "enable": True,
+            },
+            "*self_attn*input_quantizer": {
+                "num_bits": (4, 3),
+                "axis": None,
+                "enable": True,
+            },
+            **mtq.config._default_disabled_quantizer_cfg,
+        },
+        "algorithm": "max",
     },
 }
 
@@ -198,11 +243,11 @@ def quantize_model(model, quant_cfg, args, calib_dataloader=None, calibration_on
     #
     # We also provided a util method to generate the forward_loop with additional error handlings.
 
-    # Check if this is a mixed precision configuration
-    is_mixed_precision = quant_cfg.get("mixed_precision", False)
+    # Check if this is a mixed algorithm configuration
+    is_mixed_algorithm = quant_cfg.get("mixed_algorithm", False)
 
-    # Mixed precision quantization requires isolated calibration for each config
-    if is_mixed_precision:
+    # Mixed algorithm quantization requires isolated calibration for each config
+    if is_mixed_algorithm:
         calibrate_loop = create_forward_loop(dataloader=calib_dataloader)
 
         print("Starting mixed precision quantization...")
@@ -307,7 +352,8 @@ def main(args):
                 "fp8_pb_wo",
                 "w4a8_mxfp4_fp8",
                 "nvfp4_mlp_only",
-                "mixed_fp8attn_w4a8mlp",
+                "fp8attn_nvfp4mlp",
+                "mixed_fp8attn_w4a8mlp_awq",
             ]
             or args.kv_cache_qformat in KV_QUANT_CFG_CHOICES
         ), f"Quantization format {args.qformat} not supported for HF export path"
@@ -433,7 +479,7 @@ def main(args):
         mts.export(model)
 
     if args.auto_quantize_bits or args.qformat in QUANT_CFG_CHOICES:
-        if "awq" in args.qformat or args.qformat == "mixed_fp8attn_w4a8mlp":
+        if "awq" in args.qformat or args.qformat == "mixed_fp8attn_w4a8mlp_awq":
             print(
                 "\n####\nAWQ calibration could take longer than other calibration methods. "
                 "Consider reducing calib_size to reduce calibration time.\n####\n"
@@ -443,7 +489,13 @@ def main(args):
             # Calibration/sparsification will actually take much more memory than regular inference
             # due to intermediate tensors for fake quantization. Setting sample_memory_usage_ratio
             # to 2 to avoid OOM for AWQ/SmoothQuant fake quantization as it will take more memory than inference.
-            sample_memory_usage_ratio = 2 if "awq" in args.qformat or "sq" in args.qformat or args.qformat == "mixed_fp8attn_w4a8mlp" else 1.1
+            sample_memory_usage_ratio = (
+                2
+                if "awq" in args.qformat
+                or "sq" in args.qformat
+                or args.qformat == "mixed_fp8attn_w4a8mlp_awq"
+                else 1.1
+            )
             # Whisper model expects mel-spectrogram input features of length 3000
             # Whisper model needs input of shape (batch_size, num_mel_bins, 3000)
             # As the encoder of Whisper doesn't have embedding layer, input dtype has to be float
@@ -535,7 +587,7 @@ def main(args):
                 if args.qformat == "w4a8_awq" and model_type in ["gemma", "mpt"]:
                     quant_cfg["algorithm"] = {"method": "awq_lite", "alpha_step": 1}
 
-            if args.qformat == "mixed_fp8attn_w4a8mlp":
+            if args.qformat == "mixed_fp8attn_w4a8mlp_awq":
                 quant_cfg = copy.deepcopy(QUANT_CFG_CHOICES[args.qformat])
                 # If awq_block_size argument is provided, update weight_quantizer in the MLP config
                 if args.awq_block_size:
@@ -550,7 +602,7 @@ def main(args):
 
             # Check if any bmm_quantizer is in the quant_cfg. If so, we need to enable the bmm_quantizer.
             if enable_quant_kv_cache:
-                if args.qformat == "mixed_fp8attn_w4a8mlp":
+                if args.qformat == "mixed_fp8attn_w4a8mlp_awq":
                     # For mixed precision, apply KV cache quant to both configs
                     kv_cache_cfg = getattr(mtq, KV_QUANT_CFG_CHOICES[args.kv_cache_qformat])["quant_cfg"]
                     for config in quant_cfg["configs"]:
@@ -567,7 +619,7 @@ def main(args):
 
             if model_type == "phi4mm":
                 # Only quantize the language model
-                if args.qformat == "mixed_fp8attn_w4a8mlp":
+                if args.qformat == "mixed_fp8attn_w4a8mlp_awq":
                     # For mixed precision, apply to both configs
                     for config in quant_cfg["configs"]:
                         config["quant_cfg"]["*speech*"] = {"enable": False}
